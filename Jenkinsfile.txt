@@ -1,0 +1,66 @@
+/* pipeline 시작 */
+def DOCKER_IMAGE_NAME = "192.168.222.15:443/test/apache"          /*harbor-registry에 업로드할 이미지 이름*/
+def DOCKER_IMAGE_TAGS = "v1"                                                  /*harbor-registry에 업로드할 이미지 버전(tag)*/
+def NAMESPACE = "apache"                                                         /*배포할 namespace*/                
+def VERSION = "${env.BUILD_NUMBER}"
+def DATE = new Date();
+
+podTemplate(label:'builder',
+        containers: [                      /*stage 내부에 container 이름을 지정하면 template 에 작성한 image로 container가 생성*/
+            /*containerTemplate(name: 'gradle', image: 'gradle:5.6-jdk8', command: 'cat', ttyEnabled: true),*/
+            containerTemplate(name: 'docker', image: 'docker', command: 'cat', ttyEnabled: true),
+            containerTemplate(name: 'kubectl', image: 'lachlanevenson/k8s-kubectl:v1.15.3', command: 'cat',ttyEnabled: true)
+        ],
+        volumes: [
+            /*hostPathVolume(mountPath: '/home/gradle/.gradle', hostPath: '/home/admin/k8s/jenkins/.gradle'),*/
+            hostPathVolume(mountPath: '/var/run/docker.sock', hostPath: '/var/run/docker.sock')
+        ]){
+  node('builder') {
+    stage('Checkout') {
+            checkout scm   /*gitlab repository 에 업로드 된 file을 pod로 이동*/
+        }
+    stage('Docker build') {
+            container('docker') {             /* docker image build/push */
+                withCredentials([usernamePassword(
+                    credentialsId: 'harbor-registry',
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD')]) {
+                        sh "docker build -t ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAGS} ."
+                        sh "docker login 192.168.222.15:443 -u ${USERNAME} -p ${PASSWORD}"
+                        sh "docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAGS}"
+                }
+            }
+        }
+    stage('Scan') {
+        container('docker') {   /* aqua scans*/
+            sh "docker run --rm -v /tmp:/tmp 192.168.222.15:443/aquasec/scanner:6.0.21083 scan --registry Harbor-Registry test/apache:${DOCKER_IMAGE_TAGS} --host http://192.168.10.10:8080 --user administrator --password Dbsafer00!"
+        }
+    }
+    stage('Run kubectl') {
+        container('kubectl') {  /*스캔한 이미지 배포*/
+            withCredentials([usernamePassword(
+                credentialsId: 'harbor-registry',
+                usernameVariable: 'USERNAME',
+                passwordVariable: 'PASSWORD')]) {    /*namespace 여부 확인, 없을 시 생성*/
+                    sh "kubectl get ns ${NAMESPACE}|| kubectl create ns ${NAMESPACE}"
+                    sh """               /* harbor-registry에서 image 를 pull 하기 위한 secret 작성 */
+                        kubectl get secret aqua-registry -n ${NAMESPACE} || \
+                        kubectl create secret docker-registry aqua-registry \
+                        --docker-server=https://192.168.222.15:443 \
+                        --docker-username=${USERNAME} \
+                        --docker-password=${PASSWORD} \
+                        --docker-email=khgong@sysintec.co.kr \
+                        -n ${NAMESPACE}
+                    """
+                    sh "echo ${VERSION}"         /*yaml에 버전정보를 변경*/
+                    sh "sed -i.bak 's#VERSION_STRING#${VERSION}#' ./k8s/k8s-deployment.yaml"
+                    sh "echo ${DATE}"              /*yaml에 날짜를 현재로 변경*/
+                    sh "sed -i.bak 's#DATE_STRING#${DATE}#' ./k8s/k8s-deployment.yaml"
+
+                    sh "kubectl apply -f ./k8s/k8s-deployment.yaml -n ${NAMESPACE}"
+                    sh "kubectl apply -f ./k8s/k8s-service.yaml -n ${NAMESPACE}"
+                }
+            }
+        } 
+    }
+}
